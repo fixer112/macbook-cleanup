@@ -34,7 +34,6 @@ YARN_CACHE="$HOME/.yarn/cache"
 PNPM_STORE="$HOME/.pnpm-store"
 PIP_CACHE="$HOME/Library/Caches/pip"
 PUB_CACHE="$HOME/.pub-cache"
-SIM_VOLUMES_DIR="/Library/Developer/CoreSimulator/Volumes"
 
 log() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -89,47 +88,100 @@ version_key() {
   printf '%s' "$key"
 }
 
-simctl_runtime_id_for_build() {
-  local build="$1"
+list_ios_simulator_runtime_rows() {
   if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY' "$build" 2>/dev/null
-import json, subprocess, sys
-build = sys.argv[1]
-try:
-    out = subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "-j"], text=True)
-    data = json.loads(out)
-    for rt in data.get("runtimes", []):
-        b = rt.get("buildversion") or rt.get("buildVersion") or rt.get("build")
-        if b == build:
-            print(rt.get("identifier", ""))
-            sys.exit(0)
-except Exception:
-    pass
-sys.exit(1)
+    python3 - <<'PY' 2>/dev/null
+import json, subprocess
+
+def load_runtime_data():
+    for cmd in (
+        ["xcrun", "simctl", "runtime", "list", "-j"],
+        ["xcrun", "simctl", "list", "runtimes", "-j"],
+    ):
+        try:
+            return json.loads(subprocess.check_output(cmd, text=True))
+        except Exception:
+            continue
+    raise SystemExit(1)
+
+def iter_runtimes(data):
+    if isinstance(data, dict) and isinstance(data.get("runtimes"), list):
+        for rt in data["runtimes"]:
+            if isinstance(rt, dict):
+                yield rt
+        return
+    if isinstance(data, dict):
+        for ident, rt in data.items():
+            if isinstance(rt, dict):
+                item = dict(rt)
+                item.setdefault("identifier", ident)
+                yield item
+
+for rt in iter_runtimes(load_runtime_data()):
+    platform = rt.get("platformIdentifier") or ""
+    delete_id = rt.get("identifier") or rt.get("runtimeIdentifier") or ""
+    runtime_id = rt.get("runtimeIdentifier") or rt.get("identifier") or ""
+    version = rt.get("version") or ""
+    build = rt.get("buildversion") or rt.get("buildVersion") or rt.get("build") or ""
+    deletable = rt.get("deletable")
+    if platform and platform != "com.apple.platform.iphonesimulator":
+        continue
+    if not runtime_id.startswith("com.apple.CoreSimulator.SimRuntime.iOS-"):
+        continue
+    if deletable is False:
+        continue
+    if not version:
+        version = runtime_id.split(".iOS-", 1)[1].replace("-", ".")
+    print(f"{delete_id}\t{runtime_id}\t{version}\t{build}")
 PY
     return
   fi
-  xcrun simctl list runtimes 2>/dev/null | awk -v b="($build)" '
-    index($0,b) {
-      match($0,/com\.apple\.CoreSimulator\.SimRuntime\.[^ )]+/);
-      if (RSTART) { print substr($0,RSTART,RLENGTH); exit }
+
+  xcrun simctl list runtimes 2>/dev/null | awk '
+    /^iOS [0-9]/ && /com\.apple\.CoreSimulator\.SimRuntime\.iOS-/ {
+      line = $0
+      delete_id = ""
+      runtime = ""
+      version = ""
+      build = ""
+
+      if (match(line, /com\.apple\.CoreSimulator\.SimRuntime\.iOS-[^ ]+/)) {
+        runtime = substr(line, RSTART, RLENGTH)
+      }
+      delete_id = runtime
+      if (match(line, /^iOS [0-9][0-9.]*/)) {
+        version = substr(line, 5, RLENGTH - 4)
+      }
+      if (match(line, /\([0-9][0-9.]* - [^)]+\)/)) {
+        build = substr(line, RSTART + 1, RLENGTH - 2)
+        sub(/^[0-9][0-9.]* - /, "", build)
+      }
+      if (delete_id != "" && runtime != "" && version != "") {
+        print delete_id "\t" runtime "\t" version "\t" build
+      }
     }'
 }
 
-delete_ios_runtime_by_build() {
-  local build="$1"
-  local runtime_id
-  runtime_id=$(simctl_runtime_id_for_build "$build")
-  if [ -z "$runtime_id" ]; then
-    log "No simctl runtime id found for build $build; skipping."
-    return 1
+delete_ios_runtime() {
+  local delete_id="$1"
+  local runtime_id="${2:-}"
+  local version="${3:-}"
+  local build="${4:-}"
+  local label="$runtime_id"
+
+  if [ -n "$version" ]; then
+    label="iOS $version"
+    [ -n "$build" ] && label="$label (build $build)"
+    label="$label [$runtime_id]"
   fi
-  if xcrun simctl runtime delete "$runtime_id" >/dev/null 2>&1; then
-    log "Deleted runtime via simctl: $runtime_id"
+
+  if xcrun simctl runtime delete "$delete_id" >/dev/null 2>&1; then
+    log "Deleted runtime via simctl: $label"
     return 0
   fi
-  log "simctl runtime delete failed for $runtime_id; skipping."
-  return 1
+
+  log "simctl runtime delete failed for $label; skipping."
+  return 0
 }
 
 PROJECT_PRUNE_ARGS=(
@@ -268,35 +320,55 @@ log "Removing unavailable simulators via simctl"
 xcrun simctl delete unavailable >/dev/null 2>&1 || true
 
 log "Pruning iOS simulator runtimes (keep latest OS version)"
-if [ -d "$SIM_VOLUMES_DIR" ]; then
-  ios_vols=()
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    ios_vols+=("$d")
-  done < <(ls -1 "$SIM_VOLUMES_DIR" 2>/dev/null | awk '/^iOS[ _]/ {print}')
-  if [ "${#ios_vols[@]}" -gt 1 ]; then
-    latest_vol=""
-    latest_key=""
-    for d in "${ios_vols[@]}"; do
-      ver="${d#iOS }"
-      ver="${ver#iOS_}"
-      key=$(version_key "$ver")
-      if [ -z "$latest_key" ] || [[ "$key" > "$latest_key" ]]; then
-        latest_key="$key"
-        latest_vol="$d"
-      fi
-    done
-    if [ -n "$latest_vol" ]; then
-      log "Keeping iOS runtime: $SIM_VOLUMES_DIR/$latest_vol"
-      for d in "${ios_vols[@]}"; do
-        [ "$d" = "$latest_vol" ] && continue
-        build="${d#iOS }"
-        build="${build#iOS_}"
-        delete_ios_runtime_by_build "$build" || remove_dir_sudo "$SIM_VOLUMES_DIR/$d"
-      done
+ios_runtime_rows=()
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  ios_runtime_rows+=("$row")
+done < <(list_ios_simulator_runtime_rows || true)
+
+if [ "${#ios_runtime_rows[@]}" -eq 0 ]; then
+  log "No iOS runtime metadata found; skipping prune."
+elif [ "${#ios_runtime_rows[@]}" -eq 1 ]; then
+  log "Only one iOS runtime found; nothing to prune."
+else
+  latest_delete_id=""
+  latest_runtime_id=""
+  latest_version=""
+  latest_build=""
+  latest_version_key=""
+  latest_build_key=""
+
+  for row in "${ios_runtime_rows[@]}"; do
+    IFS=$'\t' read -r delete_id runtime_id version build <<< "$row"
+    [ -n "$delete_id" ] || continue
+
+    row_version_key=$(version_key "$version")
+    row_build_key=$(version_key "$build")
+    if [ -z "$latest_delete_id" ] || [[ "$row_version_key" > "$latest_version_key" ]] || { [[ "$row_version_key" = "$latest_version_key" ]] && [[ "$row_build_key" > "$latest_build_key" ]]; }; then
+      latest_delete_id="$delete_id"
+      latest_runtime_id="$runtime_id"
+      latest_version="$version"
+      latest_build="$build"
+      latest_version_key="$row_version_key"
+      latest_build_key="$row_build_key"
     fi
+  done
+
+  if [ -n "$latest_runtime_id" ]; then
+    if [ -n "$latest_build" ]; then
+      log "Keeping iOS runtime: iOS $latest_version (build $latest_build) [$latest_runtime_id]"
+    else
+      log "Keeping iOS runtime: iOS $latest_version [$latest_runtime_id]"
+    fi
+
+    for row in "${ios_runtime_rows[@]}"; do
+      IFS=$'\t' read -r delete_id runtime_id version build <<< "$row"
+      [ -n "$delete_id" ] || continue
+      [ "$delete_id" = "$latest_delete_id" ] && continue
+      delete_ios_runtime "$delete_id" "$runtime_id" "$version" "$build"
+    done
   else
-    log "Only one iOS runtime found; nothing to prune."
+    log "No iOS runtime metadata found; skipping prune."
   fi
 fi
 
@@ -541,4 +613,4 @@ else
 fi
 
 log "Done. Remaining simulator runtimes:"
-ls -lh "$SIM_VOLUMES_DIR" || true
+xcrun simctl list runtimes || true
