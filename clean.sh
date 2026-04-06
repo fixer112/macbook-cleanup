@@ -6,11 +6,12 @@ set -euo pipefail
 
 # Options
 NO_BREW="false"
-PROJECT_CLEAN="true"
+PROJECT_CLEAN="false"
 PROJECT_MAX_DEPTH="5"
 PROJECT_ROOTS=("$HOME/Documents")
 PROJECT_ROOTS_SET="false"
 AGGRESSIVE_CACHES="false"
+GRADLE_PROJECT_CLEAN="false"
 
 # Paths that may or may not exist
 XCODE_DERIVED="$HOME/Library/Developer/Xcode/DerivedData"
@@ -39,10 +40,11 @@ log() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
 usage() {
   cat <<'EOF'
-Usage: clean.sh [--no-brew] [--no-project-clean] [--aggressive-caches] [--project-root PATH] [--max-depth N]
+Usage: clean.sh [--no-brew] [--clean-project] [--aggressive-caches] [--gradle] [--project-root PATH] [--max-depth N]
   --no-brew   Skip Homebrew and CocoaPods cache cleanup
-  --no-project-clean  Skip project artifact cleanup
+  --clean-project  Enable project artifact cleanup
   --aggressive-caches  Remove ~/Library/Caches/* (rebuilds app caches)
+  --gradle  ~/DocumentsAlso remove Gradle project artifacts under project roots
   --project-root PATH  Add a project root to scan (repeatable). Default: ~/Documents
   --max-depth N  Max folder depth to scan within project roots (default: 5)
 EOF
@@ -51,8 +53,9 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-brew) NO_BREW="true"; shift ;;
-    --no-project-clean) PROJECT_CLEAN="false"; shift ;;
+    --clean-project) PROJECT_CLEAN="true"; shift ;;
     --aggressive-caches) AGGRESSIVE_CACHES="true"; shift ;;
+    --gradle) GRADLE_PROJECT_CLEAN="true"; shift ;;
     --project-root)
       shift
       [ "$#" -gt 0 ] || { printf 'Missing value for --project-root\n'; usage; exit 1; }
@@ -236,7 +239,7 @@ unmount_volume() {
 
 clean_project_artifacts() {
   if [ "$PROJECT_CLEAN" != "true" ]; then
-    log "Skipping project artifact cleanup (--no-project-clean)"
+    log "Skipping project artifact cleanup (--clean-project not specified)"
     return
   fi
   if [ "${#PROJECT_ROOTS[@]}" -eq 0 ]; then
@@ -271,6 +274,15 @@ clean_project_artifacts() {
       proj=$(dirname "$composer")
       remove_dir "$proj/vendor"
     done < <(find "$root" -maxdepth "$PROJECT_MAX_DEPTH" "${PROJECT_PRUNE_ARGS[@]}" -type f -name composer.json -print0 2>/dev/null) || true
+
+    if [ "$GRADLE_PROJECT_CLEAN" = "true" ]; then
+      while IFS= read -r -d '' gradle_file; do
+        proj=$(dirname "$gradle_file")
+        remove_dir "$proj/.gradle"
+        remove_dir "$proj/build"
+        remove_dir "$proj/.cxx"
+      done < <(find "$root" -maxdepth "$PROJECT_MAX_DEPTH" "${PROJECT_PRUNE_ARGS[@]}" -type f \( -name build.gradle -o -name build.gradle.kts -o -name settings.gradle -o -name settings.gradle.kts \) -print0 2>/dev/null) || true
+    fi
 
     while IFS= read -r -d '' pyproj; do
       proj=$(dirname "$pyproj")
@@ -601,7 +613,11 @@ remove_dir "$PUB_CACHE"
 log "Cleaning additional user caches (optional)"
 clean_aggressive_caches
 
-log "Cleaning project artifacts (Flutter/React/Node/PHP/Python)"
+if [ "$GRADLE_PROJECT_CLEAN" = "true" ]; then
+  log "Cleaning project artifacts (Flutter/React/Node/PHP/Python/Gradle)"
+else
+  log "Cleaning project artifacts (Flutter/React/Node/PHP/Python)"
+fi
 clean_project_artifacts
 
 if [ "$NO_BREW" = "true" ]; then
