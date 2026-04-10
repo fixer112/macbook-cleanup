@@ -12,7 +12,8 @@ PROJECT_ROOTS=("$HOME/Documents")
 PROJECT_ROOTS_SET="false"
 AGGRESSIVE_CACHES="false"
 GRADLE_PROJECT_CLEAN="false"
-ANDROID_AVD_DATA_SIZE="2G"
+ANDROID_AVD_DATA_SIZE="5G"
+PURGE_GRADLE_CACHE="false"
 
 # Paths that may or may not exist
 XCODE_DERIVED="$HOME/Library/Developer/Xcode/DerivedData"
@@ -48,6 +49,7 @@ Usage: clean.sh [--no-brew] [--clean-project] [--aggressive-caches] [--gradle] [
   --clean-project  Enable project artifact cleanup
   --aggressive-caches  Remove ~/Library/Caches/* (rebuilds app caches)
   --gradle  Also remove Gradle project artifacts under project roots
+  --purge-gradle-cache  Also remove shared ~/.gradle caches (forces large redownload/rebuild later)
   --android-avd-size SIZE  Reset kept Android emulator userdata to SIZE (default: 5G)
   --project-root PATH  Add a project root to scan (repeatable). Default: ~/Documents
   --max-depth N  Max folder depth to scan within project roots (default: 5)
@@ -60,6 +62,7 @@ while [ "$#" -gt 0 ]; do
     --clean-project) PROJECT_CLEAN="true"; shift ;;
     --aggressive-caches) AGGRESSIVE_CACHES="true"; shift ;;
     --gradle) GRADLE_PROJECT_CLEAN="true"; shift ;;
+    --purge-gradle-cache) PURGE_GRADLE_CACHE="true"; shift ;;
     --android-avd-size)
       shift
       [ "$#" -gt 0 ] || { printf 'Missing value for --android-avd-size\n'; usage; exit 1; }
@@ -309,6 +312,24 @@ clean_chrome_caches() {
   remove_dir "$CHROME_SUPPORT/CertificateRevocation"
   remove_dir "$CHROME_SUPPORT/ClientSidePhishing"
   remove_dir "$CHROME_SUPPORT/segmentation_platform"
+}
+
+clean_gradle_user_home() {
+  if [ ! -d "$GRADLE_CACHE" ]; then
+    return
+  fi
+
+  if [ "$PURGE_GRADLE_CACHE" = "true" ]; then
+    log "Removing shared Gradle cache (~/.gradle)"
+    remove_dir "$GRADLE_CACHE"
+    return
+  fi
+
+  log "Keeping shared Gradle dependency caches to avoid multi-GB rebuild spikes"
+  remove_dir "$GRADLE_CACHE/.tmp"
+  remove_dir "$GRADLE_CACHE/daemon"
+  remove_dir "$GRADLE_CACHE/native"
+  remove_dir "$GRADLE_CACHE/kotlin-profile"
 }
 
 clean_var_folders_temp() {
@@ -706,7 +727,7 @@ if [ -d "$ANDROID_SDK/ndk" ]; then
 fi
 
 log "Removing Gradle and user cache folders"
-remove_dir "$GRADLE_CACHE"
+clean_gradle_user_home
 remove_dir "$USER_CACHE"
 remove_dir "$NPM_CACHE"
 remove_dir "$YARN_CACHE"
