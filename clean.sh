@@ -12,6 +12,7 @@ PROJECT_ROOTS=("$HOME/Documents")
 PROJECT_ROOTS_SET="false"
 AGGRESSIVE_CACHES="false"
 GRADLE_PROJECT_CLEAN="false"
+ANDROID_AVD_DATA_SIZE="2G"
 
 # Paths that may or may not exist
 XCODE_DERIVED="$HOME/Library/Developer/Xcode/DerivedData"
@@ -24,6 +25,8 @@ VS_CODE_SUPPORT="$HOME/Library/Application Support/Code"
 CHROME_SUPPORT="$HOME/Library/Application Support/Google/Chrome"
 ANDROID_SDK="$HOME/Library/Android/sdk"
 ANDROID_AVD="$HOME/.android/avd"
+USER_CORESIM_CACHE="$HOME/Library/Developer/CoreSimulator/Caches"
+SYSTEM_CORESIM_CACHE="/Library/Developer/CoreSimulator/Caches"
 GRADLE_CACHE="$HOME/.gradle"
 USER_CACHE="$HOME/.cache"
 SWIFTPM_CACHE="$HOME/Library/Caches/org.swift.swiftpm"
@@ -44,7 +47,8 @@ Usage: clean.sh [--no-brew] [--clean-project] [--aggressive-caches] [--gradle] [
   --no-brew   Skip Homebrew and CocoaPods cache cleanup
   --clean-project  Enable project artifact cleanup
   --aggressive-caches  Remove ~/Library/Caches/* (rebuilds app caches)
-  --gradle  ~/DocumentsAlso remove Gradle project artifacts under project roots
+  --gradle  Also remove Gradle project artifacts under project roots
+  --android-avd-size SIZE  Reset kept Android emulator userdata to SIZE (default: 5G)
   --project-root PATH  Add a project root to scan (repeatable). Default: ~/Documents
   --max-depth N  Max folder depth to scan within project roots (default: 5)
 EOF
@@ -56,6 +60,12 @@ while [ "$#" -gt 0 ]; do
     --clean-project) PROJECT_CLEAN="true"; shift ;;
     --aggressive-caches) AGGRESSIVE_CACHES="true"; shift ;;
     --gradle) GRADLE_PROJECT_CLEAN="true"; shift ;;
+    --android-avd-size)
+      shift
+      [ "$#" -gt 0 ] || { printf 'Missing value for --android-avd-size\n'; usage; exit 1; }
+      ANDROID_AVD_DATA_SIZE="$1"
+      shift
+      ;;
     --project-root)
       shift
       [ "$#" -gt 0 ] || { printf 'Missing value for --project-root\n'; usage; exit 1; }
@@ -235,6 +245,66 @@ unmount_volume() {
       [ -n "$dev" ] && diskutil unmountDisk force "$dev" || true
     }
   fi
+}
+
+set_ini_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  [ -f "$file" ] || return 0
+
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i '' "s#^${key}=.*#${key}=${value}#" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+reset_avd_userdata() {
+  local avd_dir="$1"
+  local avd_name="$2"
+
+  log "Resetting Android AVD userdata for $avd_name"
+  if [ -x "$ANDROID_SDK/emulator/emulator" ] && "$ANDROID_SDK/emulator/emulator" -avd "$avd_name" -wipe-data >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Fallback: remove generated userdata and snapshot files so the AVD is recreated at the configured size.
+  remove_dir "$avd_dir/cache.img"
+  remove_dir "$avd_dir/snapshots"
+  remove_dir "$avd_dir/userdata-qemu.img"
+  remove_dir "$avd_dir/userdata-qemu.img.qcow2"
+}
+
+shrink_avd_storage() {
+  local avd_dir="$1"
+  local avd_name="$2"
+  local size="$3"
+  local cfg="$avd_dir/config.ini"
+
+  [ -f "$cfg" ] || return 0
+
+  log "Setting Android AVD $avd_name data partition to $size"
+  set_ini_value "$cfg" "disk.dataPartition.size" "$size"
+  reset_avd_userdata "$avd_dir" "$avd_name"
+}
+
+clean_var_folders_temp() {
+  if [ ! -d /private/var/folders ]; then
+    return
+  fi
+
+  log "Cleaning selected /private/var/folders temp artifacts"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    remove_dir "$path"
+  done < <(
+    find /private/var/folders \
+      \( -type d \( -name "com.google.Chrome.code_sign_clone" -o -name "com.microsoft.VSCode.ShipIt.*" -o -name "flutter_tools.*" \) \
+      -o -type f \( -name "TelemetryUploadFilecom.microsoft.autoupdate*.txt" -o -name "kotlin-daemon.*.log" \) \) \
+      2>/dev/null
+  ) || true
 }
 
 clean_project_artifacts() {
@@ -449,6 +519,10 @@ remove_dir "$SWIFTPM_CACHE"
 remove_dir "$COCOAPODS_CACHE"
 remove_dir "$CARTHAGE_CACHE"
 
+log "Cleaning CoreSimulator caches"
+remove_dir "$USER_CORESIM_CACHE"
+remove_dir_sudo "$SYSTEM_CORESIM_CACHE"
+
 log "Cleaning VS Code caches"
 remove_dir "$VS_CODE_SUPPORT/Cache"
 remove_dir "$VS_CODE_SUPPORT/CachedData"
@@ -465,6 +539,7 @@ remove_dir "$CHROME_SUPPORT/OptGuideOnDeviceModel"
 log "Pruning Android emulators and system images (keep latest OS version)"
 latest_android_ver=""
 latest_android_key=""
+kept_avd_dirs=()
 
 if [ -d "$ANDROID_AVD" ]; then
   avd_dirs=()
@@ -511,6 +586,7 @@ if [ -d "$ANDROID_AVD" ]; then
       done
       if [ "$uniq_count" -le 1 ]; then
         log "Only one Android emulator OS version found; nothing to prune."
+        kept_avd_dirs=("${avd_dirs[@]}")
       else
         log "Keeping Android AVDs for OS version $latest_android_ver"
         for row in "${avd_rows[@]}"; do
@@ -520,11 +596,24 @@ if [ -d "$ANDROID_AVD" ]; then
             remove_dir "$d"
             ini="${d%.avd}.ini"
             [ -e "$ini" ] && remove_dir "$ini"
+          else
+            kept_avd_dirs+=("$d")
           fi
         done
       fi
     fi
   fi
+fi
+
+if [ "${#kept_avd_dirs[@]}" -gt 0 ]; then
+  log "Shrinking kept Android AVD userdata to $ANDROID_AVD_DATA_SIZE"
+  for d in "${kept_avd_dirs[@]}"; do
+    cfg="$d/config.ini"
+    [ -f "$cfg" ] || continue
+    avd_name=$(awk -F= '/^AvdId=/ {print $2; exit}' "$cfg")
+    [ -n "$avd_name" ] || avd_name="$(basename "$d" .avd)"
+    shrink_avd_storage "$d" "$avd_name" "$ANDROID_AVD_DATA_SIZE"
+  done
 fi
 
 if [ -d "$ANDROID_SDK/system-images" ]; then
@@ -566,38 +655,31 @@ if [ -d "$ANDROID_SDK/system-images" ]; then
   fi
 fi
 
-log "Pruning Android NDKs (keep latest two)"
+log "Pruning Android NDKs (keep latest only)"
 if [ -d "$ANDROID_SDK/ndk" ]; then
   ndk_dirs=()
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     ndk_dirs+=("$d")
   done < <(find "$ANDROID_SDK/ndk" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null)
-  if [ "${#ndk_dirs[@]}" -gt 2 ]; then
+  if [ "${#ndk_dirs[@]}" -gt 1 ]; then
     keep_a=""
-    keep_b=""
     keep_a_key=""
-    keep_b_key=""
     for d in "${ndk_dirs[@]}"; do
       key=$(version_key "$d")
       if [ -z "$keep_a_key" ] || [[ "$key" > "$keep_a_key" ]]; then
-        keep_b="$keep_a"
-        keep_b_key="$keep_a_key"
         keep_a="$d"
         keep_a_key="$key"
-      elif [ -z "$keep_b_key" ] || [[ "$key" > "$keep_b_key" ]]; then
-        keep_b="$d"
-        keep_b_key="$key"
       fi
     done
-    log "Keeping NDKs: $keep_a $keep_b"
+    log "Keeping Android NDK: $keep_a"
     for d in "${ndk_dirs[@]}"; do
-      if [ "$d" != "$keep_a" ] && [ "$d" != "$keep_b" ]; then
+      if [ "$d" != "$keep_a" ]; then
         remove_dir "$ANDROID_SDK/ndk/$d"
       fi
     done
   else
-    log "NDK versions <=2; nothing to prune."
+    log "Only one Android NDK found; nothing to prune."
   fi
 fi
 
@@ -609,6 +691,8 @@ remove_dir "$YARN_CACHE"
 remove_dir "$PNPM_STORE"
 remove_dir "$PIP_CACHE"
 remove_dir "$PUB_CACHE"
+
+clean_var_folders_temp
 
 log "Cleaning additional user caches (optional)"
 clean_aggressive_caches
