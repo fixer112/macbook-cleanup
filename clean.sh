@@ -290,6 +290,27 @@ shrink_avd_storage() {
   reset_avd_userdata "$avd_dir" "$avd_name"
 }
 
+clean_chrome_caches() {
+  if [ ! -d "$CHROME_SUPPORT" ]; then
+    return
+  fi
+
+  log "Cleaning Chrome caches"
+  remove_dir "$CHROME_SUPPORT/BrowserMetrics"
+  remove_dir "$CHROME_SUPPORT/ShaderCache"
+  remove_dir "$CHROME_SUPPORT/GraphiteDawnCache"
+  remove_dir "$CHROME_SUPPORT/GrShaderCache"
+  remove_dir "$CHROME_SUPPORT/component_crx_cache"
+  remove_dir "$CHROME_SUPPORT/extensions_crx_cache"
+  remove_dir "$CHROME_SUPPORT/optimization_guide_model_store"
+  remove_dir "$CHROME_SUPPORT/OnDeviceHeadSuggestModel"
+  remove_dir "$CHROME_SUPPORT/WasmTtsEngine"
+  remove_dir "$CHROME_SUPPORT/Safe Browsing"
+  remove_dir "$CHROME_SUPPORT/CertificateRevocation"
+  remove_dir "$CHROME_SUPPORT/ClientSidePhishing"
+  remove_dir "$CHROME_SUPPORT/segmentation_platform"
+}
+
 clean_var_folders_temp() {
   if [ ! -d /private/var/folders ]; then
     return
@@ -535,6 +556,7 @@ remove_dir "$VS_CODE_SUPPORT/GPUCache"
 
 log "Removing Chrome OptGuideOnDeviceModel cache (large)"
 remove_dir "$CHROME_SUPPORT/OptGuideOnDeviceModel"
+clean_chrome_caches
 
 log "Pruning Android emulators and system images (keep latest OS version)"
 latest_android_ver=""
