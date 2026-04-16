@@ -5,7 +5,8 @@
 set -euo pipefail
 
 # Options
-NO_BREW="false"
+RUN_BREW="false"
+CLEAR_WHATSAPP="false"
 PROJECT_CLEAN="false"
 PROJECT_MAX_DEPTH="5"
 PROJECT_ROOTS=("$HOME/Documents")
@@ -39,13 +40,17 @@ YARN_CACHE="$HOME/.yarn/cache"
 PNPM_STORE="$HOME/.pnpm-store"
 PIP_CACHE="$HOME/Library/Caches/pip"
 PUB_CACHE="$HOME/.pub-cache"
+WHATSAPP_GROUP_CONTAINER="$HOME/Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
+WHATSAPP_DESKTOP_CONTAINER="$HOME/Library/Containers/desktop.WhatsApp"
+WHATSAPP_NATIVE_CONTAINER="$HOME/Library/Containers/net.whatsapp.WhatsApp"
 
 log() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
 usage() {
   cat <<'EOF'
-Usage: clean.sh [--no-brew] [--clean-project] [--aggressive-caches] [--gradle] [--project-root PATH] [--max-depth N]
-  --no-brew   Skip Homebrew and CocoaPods cache cleanup
+Usage: clean.sh [--brew] [--clear-whatsapp] [--clean-project] [--aggressive-caches] [--gradle] [--project-root PATH] [--max-depth N]
+  --brew   Run Homebrew cleanup, including autoremove for unused dependency formulae
+  --clear-whatsapp  Delete local WhatsApp Mac app data (destructive; may require sign-in/sync again)
   --clean-project  Enable project artifact cleanup
   --aggressive-caches  Remove ~/Library/Caches/* (rebuilds app caches)
   --gradle  Also remove Gradle project artifacts under project roots
@@ -58,7 +63,8 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --no-brew) NO_BREW="true"; shift ;;
+    --brew) RUN_BREW="true"; shift ;;
+    --clear-whatsapp) CLEAR_WHATSAPP="true"; shift ;;
     --clean-project) PROJECT_CLEAN="true"; shift ;;
     --aggressive-caches) AGGRESSIVE_CACHES="true"; shift ;;
     --gradle) GRADLE_PROJECT_CLEAN="true"; shift ;;
@@ -200,6 +206,62 @@ delete_ios_runtime() {
   return 0
 }
 
+clean_homebrew_and_cocoapods() {
+  local dry_run_output=""
+  local line=""
+
+  if command -v brew >/dev/null 2>&1; then
+    log "Checking for unused Homebrew dependency formulae"
+    if dry_run_output=$(brew autoremove --dry-run 2>&1); then
+      if [ -n "$(printf '%s' "$dry_run_output" | tr -d '[:space:]')" ]; then
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          log "brew autoremove --dry-run: $line"
+        done <<< "$dry_run_output"
+      else
+        log "No unused Homebrew dependency formulae detected."
+      fi
+
+      log "Removing unused Homebrew dependency formulae"
+      brew autoremove || true
+    else
+      log "brew autoremove --dry-run failed; skipping automatic Homebrew dependency uninstall."
+      if [ -n "$(printf '%s' "$dry_run_output" | tr -d '[:space:]')" ]; then
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          log "brew autoremove --dry-run: $line"
+        done <<< "$dry_run_output"
+      fi
+    fi
+
+    log "Running Homebrew cache cleanup"
+    log "Homebrew keeps old kegs for outdated formulae until you upgrade them; run 'brew upgrade' then rerun --brew to reclaim that space."
+    brew cleanup -q -s || true
+  else
+    log "Homebrew not found; skipping Homebrew cleanup."
+  fi
+
+  if command -v pod >/dev/null 2>&1; then
+    log "Running CocoaPods cache cleanup"
+    pod cache clean --all || true
+  else
+    log "CocoaPods not found; skipping CocoaPods cache cleanup."
+  fi
+}
+
+clear_whatsapp_local_data() {
+  log "Clearing local WhatsApp Mac data (destructive; app may need sign-in/sync again)"
+
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e 'tell application "WhatsApp" to quit' >/dev/null 2>&1 || true
+  fi
+  pkill -x WhatsApp >/dev/null 2>&1 || true
+
+  remove_dir "$WHATSAPP_GROUP_CONTAINER"
+  remove_dir "$WHATSAPP_DESKTOP_CONTAINER"
+  remove_dir "$WHATSAPP_NATIVE_CONTAINER"
+}
+
 PROJECT_PRUNE_ARGS=(
   -type d \( -name .git -o -name node_modules -o -name vendor -o -name build -o -name .dart_tool -o -name .gradle -o -name .cache -o -name Library -o -name Pods -o -name DerivedData -o -name .tox -o -name .nox -o -name .venv -o -name venv -o -name __pycache__ \) -prune -o
 )
@@ -268,13 +330,21 @@ reset_avd_userdata() {
   local avd_dir="$1"
   local avd_name="$2"
 
+  # Fastboot snapshots can retain GBs of stale state even after a wipe.
+  remove_dir "$avd_dir/snapshots"
+  remove_dir "$avd_dir/snapshot.lock.lock"
+  remove_dir "$avd_dir/snapshot.trace"
+  remove_dir "$avd_dir/read-snapshot.txt"
+
   log "Resetting Android AVD userdata for $avd_name"
   if [ -x "$ANDROID_SDK/emulator/emulator" ] && "$ANDROID_SDK/emulator/emulator" -avd "$avd_name" -wipe-data >/dev/null 2>&1; then
+    remove_dir "$avd_dir/cache.img.qcow2"
     return 0
   fi
 
   # Fallback: remove generated userdata and snapshot files so the AVD is recreated at the configured size.
   remove_dir "$avd_dir/cache.img"
+  remove_dir "$avd_dir/cache.img.qcow2"
   remove_dir "$avd_dir/snapshots"
   remove_dir "$avd_dir/userdata-qemu.img"
   remove_dir "$avd_dir/userdata-qemu.img.qcow2"
@@ -747,12 +817,17 @@ else
 fi
 clean_project_artifacts
 
-if [ "$NO_BREW" = "true" ]; then
-  log "Skipping Homebrew and CocoaPods cache cleanup (--no-brew)"
+if [ "$CLEAR_WHATSAPP" = "true" ]; then
+  clear_whatsapp_local_data
 else
-  log "Running Homebrew and CocoaPods cache cleanup"
-  brew cleanup -s || true
-  pod cache clean --all || true
+  log "Skipping WhatsApp local data cleanup by default (use --clear-whatsapp to enable)"
+fi
+
+if [ "$RUN_BREW" = "true" ]; then
+  log "Running Homebrew and CocoaPods cleanup"
+  clean_homebrew_and_cocoapods
+else
+  log "Skipping Homebrew and CocoaPods cleanup by default (use --brew to enable)"
 fi
 
 log "Done. Remaining simulator runtimes:"
